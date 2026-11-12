@@ -10,3 +10,11 @@ opencv-python>=4.8.0
 pynput>=1.7.6
 pyarrow>=14.0.0
 pyyaml>=6.0
+
+# Pipeline: Gemini API for task prompts and gripper detection
+google-generativeai>=0.8.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0

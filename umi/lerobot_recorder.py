@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import rerun as rr
 from rerun.components import FillMode
@@ -27,9 +28,11 @@ from api import ControllerTrackingClient, PoseData, ControllerState
 try:
     from .camera_manager import CameraManager, CameraConfig
     from .lerobot_writer import LeRobotFormatWriter, FeatureDefinition
+    from .gripper_detector import GripperDetector
 except ImportError:
     from camera_manager import CameraManager, CameraConfig
     from lerobot_writer import LeRobotFormatWriter, FeatureDefinition
+    from gripper_detector import GripperDetector
 
 
 def load_glb_mesh(filepath: str, scale: float = 0.01) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -89,6 +92,8 @@ class LeRobotDatasetRecorder:
         tasks: Optional[List[str]] = None,
         output_dir: str = './datasets',
         urdf_path: Optional[str] = None,
+        gripper_calibration_path: Optional[str] = None,
+        gripper_camera: Optional[str] = None,
     ):
         self.repo_id = repo_id
         self.server_url = server_url
@@ -99,6 +104,18 @@ class LeRobotDatasetRecorder:
         self.selected_task_idx = 0
         self.output_dir = Path(output_dir)
         self.urdf_path = urdf_path
+
+        # Gripper state detection
+        self.gripper_detector: Optional[GripperDetector] = None
+        self.gripper_camera = gripper_camera
+        self.latest_gripper_state: float = 0.5  # Default mid-state
+
+        if gripper_calibration_path:
+            try:
+                self.gripper_detector = GripperDetector(gripper_calibration_path)
+                print(f"Gripper detection enabled: {gripper_calibration_path}")
+            except Exception as e:
+                print(f"Warning: Could not load gripper calibration: {e}")
 
         # Robot IK state (initialized in _setup_robot_ik if urdf_path provided)
         self.robot_viz = None  # RerunURDFVisualizer
@@ -184,7 +201,7 @@ class LeRobotDatasetRecorder:
         # === Robot Frame Transforms ===
 
         # Robot base rotation (180° around Z so robot faces user)
-        self.robot_base_rotation = Rotation.from_euler('z', 180, degrees=True).as_matrix()
+        self.robot_base_rotation = Rotation.from_euler('z', -90, degrees=True).as_matrix()
 
         # Tool-to-gripper rotation: swaps X↔Y axes to align controller with robot gripper
         self.tool_to_gripper_rotation = np.array([
@@ -395,7 +412,7 @@ class LeRobotDatasetRecorder:
                     self.ik_robot.set_joint(name, 0.0)
                 self.ik_robot.update_kinematics()
                 # Get home gripper_frame pose for relative control
-                self.current_robot_pose = self.ik_robot.get_T_world_frame("gripper_frame").copy()
+                self.current_robot_pose = self.ik_robot.get_T_world_frame("gripper").copy()
                 # Update visualization
                 if self.robot_viz:
                     positions_dict = {name: 0.0 for name in self.arm_joint_names}
@@ -434,8 +451,8 @@ class LeRobotDatasetRecorder:
         self.ik_solver.dt = 1.0 / self.fps
 
         # Add frame task for gripper
-        self.ik_task = self.ik_solver.add_frame_task("gripper_frame", np.eye(4))
-        self.ik_task.configure("gripper_frame", "soft", 1.0, 0.2)
+        self.ik_task = self.ik_solver.add_frame_task("gripper", np.eye(4))
+        self.ik_task.configure("gripper", "soft", 1.0, 0.2)
         self.ik_solver.add_regularization_task(1e-4)
 
         # Set initial joint positions to zero (only arm joints)
@@ -444,7 +461,7 @@ class LeRobotDatasetRecorder:
         self.ik_robot.update_kinematics()
 
         # Initialize current robot pose to home position (for relative control)
-        self.current_robot_pose = self.ik_robot.get_T_world_frame("gripper_frame").copy()
+        self.current_robot_pose = self.ik_robot.get_T_world_frame("gripper").copy()
 
         print(f"  Robot arm joints: {self.arm_joint_names}")
         print("  Robot IK ready")
@@ -492,7 +509,7 @@ class LeRobotDatasetRecorder:
             self.origin_position = current_pos.copy()
             self.origin_quaternion = current_quat.copy()
             if self.current_robot_pose is None:
-                self.current_robot_pose = self.ik_robot.get_T_world_frame("gripper_frame").copy()
+                self.current_robot_pose = self.ik_robot.get_T_world_frame("gripper").copy()
             print(f">>> Origin captured at pos={self.origin_position}")
 
         # Compute incremental deltas
@@ -738,6 +755,10 @@ class LeRobotDatasetRecorder:
         for camera_name, image in camera_frames.items():
             rr.log(f'cameras/{camera_name}', rr.Image(image))
 
+        # Log gripper state as scalar time series
+        if self.gripper_detector is not None:
+            rr.log("gripper/state", rr.Scalars(self.latest_gripper_state))
+
         # Controls overlay and episode info
         self._log_controls_overlay()
         self._log_episode_info()
@@ -777,6 +798,12 @@ class LeRobotDatasetRecorder:
         for camera_name, image in camera_frames.items():
             frame_data[f"observation.images.{camera_name}"] = image
 
+        # Vision-based gripper state
+        if self.gripper_detector is not None:
+            frame_data["observation.gripper_state"] = np.array(
+                [self.latest_gripper_state], dtype=np.float32
+            )
+
         self.writer.add_frame(frame_data)
         self.episode_frame_count += 1
 
@@ -798,6 +825,19 @@ class LeRobotDatasetRecorder:
 
                 # Capture cameras
                 camera_frames = self.camera_manager.capture_all()
+
+                # Detect gripper state from camera frame
+                if self.gripper_detector is not None and camera_frames:
+                    # Use specified gripper camera or first available
+                    gripper_frame = None
+                    if self.gripper_camera and self.gripper_camera in camera_frames:
+                        gripper_frame = camera_frames[self.gripper_camera]
+                    else:
+                        gripper_frame = next(iter(camera_frames.values()), None)
+
+                    if gripper_frame is not None:
+                        result = self.gripper_detector.get_gripper_state(gripper_frame)
+                        self.latest_gripper_state = result.state
 
                 # Visualize
                 self._visualize_frame(self.latest_pose, camera_frames)
@@ -864,6 +904,126 @@ def load_tasks_from_yaml(filepath: str) -> List[str]:
     return tasks[:9]  # Max 9 tasks (keys 1-9)
 
 
+def setup_camera_interactive(config_path: str) -> bool:
+    """
+    Interactive camera selection and configuration.
+
+    Scans for available cameras, lets user select one,
+    and saves the selection to the config file.
+
+    Returns:
+        True if setup was successful, False otherwise
+    """
+    import yaml
+
+    print("\n=== Camera Setup ===\n")
+    print("Scanning for available cameras...")
+
+    available = CameraManager.list_available_cameras()
+
+    if not available:
+        print("No cameras found! Please connect a USB camera and try again.")
+        return False
+
+    # Get camera info (resolution) for each
+    camera_info = []
+    for idx in available:
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            camera_info.append((idx, width, height))
+            print(f"  [{len(camera_info)}] Camera {idx}: {width}x{height}")
+
+    if not camera_info:
+        print("Could not read from any camera!")
+        return False
+
+    # Let user select camera
+    print()
+    while True:
+        try:
+            choice = input(f"Select camera [1-{len(camera_info)}]: ").strip()
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(camera_info):
+                break
+            print(f"Please enter a number between 1 and {len(camera_info)}")
+        except ValueError:
+            print("Please enter a valid number")
+        except KeyboardInterrupt:
+            print("\nCancelled")
+            return False
+
+    selected = camera_info[choice_idx]
+    camera_idx, width, height = selected
+
+    # Ask for camera name
+    print()
+    name = input("Camera name (e.g., 'wrist', 'overhead') [wrist]: ").strip()
+    if not name:
+        name = "wrist"
+
+    # Ask for resolution (use detected as default)
+    print(f"\nResolution detected: {width}x{height}")
+    res_input = input(f"Use this resolution? [Y/n]: ").strip().lower()
+
+    if res_input == 'n':
+        print("Common resolutions: 640x480, 1280x720, 1920x1080")
+        res = input("Enter resolution (WxH): ").strip()
+        try:
+            w, h = res.lower().split('x')
+            width, height = int(w), int(h)
+        except ValueError:
+            print(f"Invalid format, using {width}x{height}")
+
+    # Build camera string
+    camera_string = f"{camera_idx}:{name}:{width}x{height}"
+    print(f"\nCamera config: {camera_string}")
+
+    # Load existing config or create new one
+    config = {}
+    config_file = Path(config_path)
+
+    if config_file.exists():
+        try:
+            with open(config_file) as f:
+                config = yaml.safe_load(f) or {}
+            print(f"\nUpdating existing config: {config_path}")
+        except Exception as e:
+            print(f"Warning: Could not read existing config: {e}")
+    else:
+        print(f"\nCreating new config: {config_path}")
+
+    # Update camera setting
+    config['camera'] = camera_string
+
+    # Ensure other required fields have defaults
+    if 'repo_id' not in config:
+        config['repo_id'] = 'user/my_dataset'
+    if 'fps' not in config:
+        config['fps'] = 30
+    if 'output_dir' not in config:
+        config['output_dir'] = './datasets'
+    if 'server' not in config:
+        config['server'] = 'https://localhost:8000'
+    if 'hand' not in config:
+        config['hand'] = 'right'
+
+    # Write config
+    try:
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_file, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        print(f"\n Config saved to: {config_path}")
+        print(f"\nYou can now run:")
+        print(f"  python -m umi.lerobot_recorder --config {config_path}")
+        return True
+    except Exception as e:
+        print(f"Error saving config: {e}")
+        return False
+
+
 async def main():
     parser = argparse.ArgumentParser(
         description='Record UMI teleoperation to LeRobot dataset format',
@@ -891,7 +1051,13 @@ Examples:
     parser.add_argument('--tasks-file', help='YAML file with task descriptions (deprecated, use config)')
     parser.add_argument('--output-dir', help='Output directory')
     parser.add_argument('--list-cameras', action='store_true', help='List cameras and exit')
+    parser.add_argument('--setup-camera', action='store_true',
+                        help='Interactive camera selection and save to config')
     parser.add_argument('--urdf', help='Path to robot URDF for IK visualization (non-bimanual only)')
+
+    # Gripper detection arguments
+    parser.add_argument('--gripper-calibration', help='Path to gripper calibration YAML file')
+    parser.add_argument('--gripper-camera', help='Camera name for gripper detection (default: first camera)')
 
     # Camera arguments
     parser.add_argument('--camera', help='Camera for single UMI mode: INDEX:NAME:WxH')
@@ -924,6 +1090,8 @@ Examples:
     fps = get_val(args.fps, 'fps', 30)
     output_dir = get_val(args.output_dir, 'output_dir', './datasets')
     urdf = get_val(args.urdf, 'urdf')
+    gripper_calibration = get_val(args.gripper_calibration, 'gripper_calibration')
+    gripper_camera = get_val(args.gripper_camera, 'gripper_camera')
     camera = get_val(args.camera, 'camera')
     hand = get_val(args.hand, 'hand', 'right')
     bimanual = args.bimanual or config.get('bimanual', False)
@@ -949,6 +1117,11 @@ Examples:
         print("\nUsage:")
         print("  Single mode:   --camera INDEX:NAME:WxH")
         print("  Bimanual mode: --bimanual --camera-left INDEX:NAME:WxH --camera-right INDEX:NAME:WxH")
+        return
+
+    if args.setup_camera:
+        config_path = args.config or "config.yaml"
+        setup_camera_interactive(config_path)
         return
 
     if not repo_id:
@@ -995,6 +1168,8 @@ Examples:
         tasks=tasks,
         output_dir=output_dir,
         urdf_path=urdf,
+        gripper_calibration_path=gripper_calibration,
+        gripper_camera=gripper_camera,
     )
 
     try:

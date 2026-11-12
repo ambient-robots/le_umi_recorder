@@ -22,6 +22,11 @@ hand: right  # Which controller the camera is attached to (left/right)
 # Robot URDF for IK visualization (optional, non-bimanual only)
 # urdf: /path/to/robot.urdf
 
+# Gripper state detection (optional)
+# Run 'python -m umi.calibrate_gripper' to generate calibration file
+# gripper_calibration: gripper_calibration.yaml
+# gripper_camera: wrist  # Camera name to use for detection (default: first camera)
+
 # Task descriptions (select with keys 1-9 during recording)
 tasks:
   - Pick up the cup

@@ -1,2 +1,4 @@
 backend/venv/
 backend/certs/
+*.pyc
+__pycache__/
